@@ -474,7 +474,16 @@ async def handle_city_selection(update: Update, context: ContextTypes.DEFAULT_TY
                          logger.error(f"Failed fallback edit for district selection: {fallback_e}")
                          await query.answer("Error displaying districts.", show_alert=True)
                 else:
-                    await query.answer() # Acknowledge if not modified
+                    # Message not modified, try to answer quietly.
+                    try:
+                        await query.answer()
+                    except telegram_error.BadRequest as ans_e:
+                        if "query is too old" in str(ans_e).lower():
+                            logger.debug(f"Query answer failed after 'message not modified' for user {user_id} (Query likely expired).")
+                        else:
+                            logger.warning(f"Unexpected BadRequest answering query after 'message not modified' for user {user_id}: {ans_e}")
+                    except Exception as other_ans_e:
+                        logger.warning(f"Error answering query after 'message not modified' for user {user_id}: {other_ans_e}")
 # --- END handle_city_selection ---
 
 
@@ -581,82 +590,218 @@ async def handle_type_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
 # --- END OF handle_type_selection ---
 
-# <<< MODIFIED: Add Pay Now Button >>>
-async def handle_product_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
+# <<< MODIFIED: Add Pay Now Button and Store Original Params for Cancel >>>
+async def handle_pay_single_item(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
+    """Handles the 'Pay Now' button directly from product selection."""
     query = update.callback_query
-    user_id = query.from_user.id # <<< Get user_id
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
     lang, lang_data = _get_lang_data(context)
-    if not params or len(params) < 5: logger.warning("handle_product_selection missing params."); await query.answer("Error: Incomplete product data.", show_alert=True); return
+
+    if not params or len(params) < 5:
+        logger.warning("handle_pay_single_item missing params."); await query.answer("Error: Incomplete product data.", show_alert=True); return
     city_id, dist_id, p_type, size, price_str = params # price_str is ORIGINAL price
 
     try: original_price = Decimal(price_str)
-    except ValueError: logger.warning(f"Invalid price format: {price_str}"); await query.edit_message_text("❌ Error: Invalid product data.", parse_mode=None); return
+    except ValueError: logger.warning(f"Invalid price format pay_single_item: {price_str}"); await query.edit_message_text("❌ Error: Invalid product data.", parse_mode=None); return
 
     city = CITIES.get(city_id); district = DISTRICTS.get(city_id, {}).get(dist_id)
     if not city or not district: error_location_mismatch = lang_data.get("error_location_mismatch", "Error: Location data mismatch."); await query.edit_message_text(f"❌ {error_location_mismatch}", parse_mode=None); return await handle_shop(update, context)
 
-    product_emoji = PRODUCT_TYPES.get(p_type, DEFAULT_PRODUCT_EMOJI)
-    theme_name = context.user_data.get("theme", "default")
-    theme = THEMES.get(theme_name, THEMES["default"])
-    basket_emoji = theme.get('basket', EMOJI_BASKET)
+    await query.answer("⏳ Reserving & checking payment...")
 
-    price_label = lang_data.get("price_label", "Price"); available_label_long = lang_data.get("available_label_long", "Available")
-    back_options_button = lang_data.get("back_options_button", "Back to Options"); home_button = lang_data.get("home_button", "Home")
-    drop_unavailable_msg = lang_data.get("drop_unavailable", "Drop Unavailable! This option just sold out or was reserved.")
-    add_to_basket_button = lang_data.get("add_to_basket_button", "Add to Basket")
-    pay_now_button_text = lang_data.get("pay_now_button", "Pay Now") # <<< Get Pay Now text
-    error_loading_details = lang_data.get("error_loading_details", "Error: Failed to Load Product Details"); error_unexpected = lang_data.get("error_unexpected", "An unexpected error occurred")
-
+    reserved_id = None
     conn = None
+    product_details_for_snapshot = None
+    error_occurred_reservation = False # Flag specific to reservation phase
+
+    # 1. Attempt to reserve one specific item instance
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        # Check availability using original price
-        c.execute("SELECT COUNT(*) as count FROM products WHERE city = ? AND district = ? AND product_type = ? AND size = ? AND price = ? AND available > reserved", (city, district, p_type, size, float(original_price)))
-        available_count_result = c.fetchone(); available_count = available_count_result['count'] if available_count_result else 0
+        c.execute("BEGIN EXCLUSIVE")
+        # Find one available product ID matching the criteria
+        c.execute("SELECT id, name, price, size, product_type FROM products WHERE city = ? AND district = ? AND product_type = ? AND size = ? AND price = ? AND available > reserved ORDER BY id LIMIT 1", (city, district, p_type, size, float(original_price)))
+        product_to_reserve = c.fetchone()
 
-        if available_count <= 0:
-            keyboard = [[InlineKeyboardButton(f"{EMOJI_BACK} {back_options_button}", callback_data=f"type|{city_id}|{dist_id}|{p_type}"), InlineKeyboardButton(f"{EMOJI_HOME} {home_button}", callback_data="back_start")]]
-            await query.edit_message_text(f"❌ {drop_unavailable_msg}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+        if not product_to_reserve:
+            conn.rollback()
+            logger.warning(f"Item {p_type} {size} in {city}/{district} taken before pay_single user {user_id}.")
+            # Try editing message, ignore if it fails (e.g., query too old)
+            try: await query.edit_message_text("❌ Sorry, this item was just taken!", parse_mode=None)
+            except Exception: pass
+            error_occurred_reservation = True # Set flag but return later
         else:
-            original_price_formatted = format_currency(original_price)
-            # <<< Calculate reseller price for display >>>
-            reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, p_type)
-            display_price_str = original_price_formatted
-            if reseller_discount_percent > Decimal('0.0'):
-                discount_amount = (original_price * reseller_discount_percent / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-                discounted_price = original_price - discount_amount
-                display_price_str = f"{format_currency(discounted_price)} (Orig: {original_price_formatted}€)"
-            # <<< End calculate >>>
+            reserved_id = product_to_reserve['id']
+            product_details_for_snapshot = dict(product_to_reserve) # Store details
 
-            msg = (f"{EMOJI_CITY} {city} | {EMOJI_DISTRICT} {district}\n"
-                   f"{product_emoji} {p_type} - {size}\n"
-                   # <<< Display calculated price string >>>
-                   f"{EMOJI_PRICE} {price_label}: {display_price_str} EUR\n"
-                   f"{EMOJI_QUANTITY} {available_label_long}: {available_count}")
+            # Attempt to reserve it
+            update_result = c.execute("UPDATE products SET reserved = reserved + 1 WHERE id = ? AND available > reserved", (reserved_id,))
 
-            # Callback still uses original price
-            add_callback = f"add|{city_id}|{dist_id}|{p_type}|{size}|{price_str}"
-            back_callback = f"type|{city_id}|{dist_id}|{p_type}"
-            # <<< ADDED: Pay Now Callback >>>
-            pay_now_callback = f"pay_single_item|{city_id}|{dist_id}|{p_type}|{size}|{price_str}"
+            if update_result.rowcount == 1:
+                conn.commit() # Commit the reservation
+                logger.info(f"Successfully reserved product {reserved_id} for single item payment by user {user_id}.")
+            else:
+                # Race condition - someone else reserved it between SELECT and UPDATE
+                conn.rollback()
+                logger.warning(f"Failed to reserve product {reserved_id} (race condition?) for single item payment user {user_id}.")
+                try: await query.edit_message_text("❌ Sorry, this item was just taken!", parse_mode=None)
+                except Exception: pass
+                error_occurred_reservation = True # Set flag but return later
 
-            keyboard = [
-                # <<< ADDED: Button row with Add and Pay Now >>>
-                [
-                    InlineKeyboardButton(f"{basket_emoji} {add_to_basket_button}", callback_data=add_callback),
-                    InlineKeyboardButton(f"{EMOJI_PAY_NOW} {pay_now_button_text}", callback_data=pay_now_callback)
-                ],
-                [InlineKeyboardButton(f"{EMOJI_BACK} {back_options_button}", callback_data=back_callback), InlineKeyboardButton(f"{EMOJI_HOME} {home_button}", callback_data="back_start")]
-            ]
-            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
-    except sqlite3.Error as e: logger.error(f"DB error checking availability {city}/{district}/{p_type}/{size}: {e}", exc_info=True); await query.edit_message_text(f"❌ {error_loading_details}", parse_mode=None)
-    except Exception as e: logger.error(f"Unexpected error in handle_product_selection: {e}", exc_info=True); await query.edit_message_text(f"❌ {error_unexpected}", parse_mode=None)
+    except sqlite3.Error as e:
+        logger.error(f"DB error reserving single item {p_type} {size} user {user_id}: {e}")
+        if conn and conn.in_transaction: conn.rollback()
+        try: await query.edit_message_text("❌ Database error during reservation.", parse_mode=None)
+        except Exception: pass
+        error_occurred_reservation = True # Set flag
     finally:
         if conn: conn.close()
 
-# --- END handle_product_selection ---
+    # --- Return early if reservation failed ---
+    if error_occurred_reservation:
+        return
 
+    # --- Proceed if reservation was successful ---
+    if reserved_id and product_details_for_snapshot:
+        # 2. Create single-item snapshot
+        single_item_snapshot = [{
+            "product_id": reserved_id,
+            "price": float(original_price), # Store original price as float for JSON later
+            "name": product_details_for_snapshot['name'],
+            "size": product_details_for_snapshot['size'],
+            "product_type": product_details_for_snapshot['product_type']
+        }]
+
+        # 3. Calculate final price (apply reseller discount)
+        reseller_discount_percent = Decimal('0.0')
+        try: # Use await asyncio.to_thread for the synchronous function
+             reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, p_type)
+        except Exception as e:
+             logger.error(f"Error calling get_reseller_discount during single pay: {e}")
+        reseller_discount_amount = (original_price * reseller_discount_percent / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+        final_total_decimal = original_price - reseller_discount_amount
+
+        # 4. Check balance
+        conn_balance = None
+        user_balance = Decimal('0.0')
+        balance_check_error = False
+        try:
+            conn_balance = get_db_connection()
+            c_balance = conn_balance.cursor()
+            c_balance.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+            balance_result = c_balance.fetchone()
+            user_balance = Decimal(str(balance_result['balance'])) if balance_result else Decimal('0.0')
+        except sqlite3.Error as e:
+            logger.error(f"DB error fetching balance for single pay user {user_id}: {e}")
+            # Attempt to un-reserve the item if balance check fails
+            logger.info(f"Attempting to un-reserve item {reserved_id} due to balance check failure.")
+            await asyncio.to_thread(_unreserve_basket_items, single_item_snapshot) # Use helper
+            try: await query.edit_message_text("❌ Error checking balance. Item released.", parse_mode=None)
+            except Exception: pass
+            balance_check_error = True
+        finally:
+            if conn_balance: conn_balance.close()
+
+        if balance_check_error:
+             return # Stop if balance check failed
+
+        # 5. Decide payment method
+        if user_balance >= final_total_decimal:
+            # --- CORRECTED PART: Pay with balance ---
+            logger.info(f"Sufficient balance for single item pay user {user_id}. Calling process_purchase_with_balance.")
+            try:
+                # Edit message first to show processing
+                await query.edit_message_text("⏳ Processing payment with balance...", parse_mode=None)
+            except telegram_error.BadRequest as e:
+                 if "message is not modified" not in str(e).lower(): logger.warning(f"Could not edit message before balance payment: {e}")
+                 # Continue anyway
+
+            # Call the function that handles balance deduction AND finalization
+            success = await payment.process_purchase_with_balance(
+                user_id=user_id,
+                amount_to_deduct=final_total_decimal, # Pass the calculated final price
+                basket_snapshot=single_item_snapshot,
+                discount_code_used=None, # No general discount code for single item pay
+                context=context
+            )
+
+            if success:
+                # Success messages are handled within _finalize_purchase called by process_purchase_with_balance
+                logger.info(f"process_purchase_with_balance successful for single item {reserved_id} user {user_id}.")
+                # No need to edit message here again, it's handled internally
+            else:
+                 # Failure messages are handled within process_purchase_with_balance or _finalize_purchase
+                 logger.error(f"process_purchase_with_balance failed for single item {reserved_id} user {user_id}.")
+                 # The item *should* have been un-reserved if the finalization failed after balance deduction attempt.
+                 # If balance deduction itself failed, finalization wasn't called. Reservation might still exist in rare edge cases.
+
+        else:
+            # --- Insufficient balance -> Crypto payment ---
+            logger.info(f"Insufficient balance for single item pay user {user_id}. Triggering crypto flow.")
+            context.user_data['basket_pay_snapshot'] = single_item_snapshot
+            context.user_data['basket_pay_total_eur'] = float(final_total_decimal) # Use final price after reseller
+            context.user_data['basket_pay_discount_code'] = None # No general code for single pay
+            context.user_data['state'] = 'awaiting_single_item_crypto_choice' # Set specific state
+            # <<< STORE ORIGINAL PARAMS FOR CANCELLATION >>>
+            context.user_data['single_item_orig_params'] = params
+            # <<< END STORE >>>
+
+            await _show_crypto_choices_for_basket(update, context, edit_message=True)
+            # No need for extra query.answer() here as _show_crypto does it if needed
+    else:
+        # This case should ideally not be reached if error_occurred_reservation was handled
+        logger.error(f"Reached end of handle_pay_single_item without valid reservation for user {user_id}")
+        try: await query.edit_message_text("❌ An internal error occurred during payment initiation.", parse_mode=None)
+        except Exception: pass
+# --- END handle_pay_single_item ---
+
+
+# --- NEW/MODIFIED: Helper for single item payment cancellation ---
+async def _handle_cancel_single_item_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cleans up reservation and context after cancelling single item crypto flow."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    logger.info(f"Executing cancel logic for single item payment user {user_id}")
+
+    # Get the snapshot that was stored
+    single_item_snapshot = context.user_data.get('basket_pay_snapshot')
+    # Get original params to return to product view
+    orig_params = context.user_data.get('single_item_orig_params')
+
+    # Clear the temporary payment context data
+    context.user_data.pop('basket_pay_snapshot', None)
+    context.user_data.pop('basket_pay_total_eur', None)
+    context.user_data.pop('basket_pay_discount_code', None)
+    context.user_data.pop('state', None) # Clear the state
+    context.user_data.pop('single_item_orig_params', None) # Clear stored params
+
+    if single_item_snapshot:
+        # Un-reserve the item using the helper function
+        await asyncio.to_thread(_unreserve_basket_items, single_item_snapshot)
+        await query.answer("Reservation cancelled.")
+
+        # Try to go back to the specific product selection view
+        if orig_params:
+            try:
+                await handle_product_selection(update, context, params=orig_params)
+                return # Successfully returned to product view
+            except Exception as e:
+                logger.error(f"Error trying to return to product view after single item cancel: {e}")
+        else:
+             logger.warning("Could not retrieve original params for single item cancel.")
+
+        # Fallback: Go back to the start menu if returning to product fails or params missing
+        await start(update, context)
+
+    else:
+        logger.warning(f"Cancel single item pay called for user {user_id}, but no snapshot found.")
+        await query.answer("Cancellation processed (no item found).")
+        await start(update, context) # Go back to start
+# --- END _handle_cancel_single_item_pay ---
+
+
+# --- Basket Handlers ---
 # <<< MODIFIED: Incorporate Reseller Discount Calculation & Display >>>
 async def handle_add_to_basket(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     query = update.callback_query
@@ -912,16 +1057,23 @@ def validate_discount_code(code_text: str, base_total_float: float) -> tuple[boo
 
 # --- END Discount Validation ---
 
+
 # --- Basket Handlers ---
-# <<< MODIFIED: Incorporate Reseller Discount Calculation & Display >>>
+# <<< MODIFIED: Incorporate Reseller Discount Calculation & Display & State Check >>>
 async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     query = update.callback_query
     user_id = query.from_user.id
     lang, lang_data = _get_lang_data(context)
+
+    # <<< ADD CHECK FOR SINGLE ITEM CANCEL STATE >>>
+    if context.user_data.get('state') == 'awaiting_single_item_crypto_choice':
+        logger.info(f"User {user_id} cancelled single item crypto payment via 'view_basket' callback.")
+        await _handle_cancel_single_item_pay(update, context)
+        return
+    # <<< END CHECK >>>
+
     theme_name = context.user_data.get("theme", "default"); theme = THEMES.get(theme_name, THEMES["default"]); basket_emoji = theme.get('basket', EMOJI_BASKET)
-    # >>> FIX: Define reseller_discount_label <<<
     reseller_discount_label = lang_data.get("reseller_discount_label", "Reseller Discount")
-    # >>> END FIX <<<
 
     # Call synchronous clear_expired_basket (no await needed)
     clear_expired_basket(context, user_id) # Sync call to ensure basket context is up-to-date
@@ -952,7 +1104,6 @@ async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE,
     basket_items_with_details = [] # Store items with calculated discounts for display
 
     # Fetch any missing product details (e.g., name, size if not fully stored in context)
-    # Although clear_expired_basket should have populated product_type
     product_ids_in_basket = list(set(item.get('product_id') for item in basket if item.get('product_id')))
     if product_ids_in_basket:
         try:
@@ -963,7 +1114,6 @@ async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE,
             product_db_details = {row['id']: {'name': row['name'], 'size': row['size']} for row in c.fetchall()}
         except sqlite3.Error as e:
             logger.error(f"DB error fetching product names/sizes for basket view user {user_id}: {e}")
-            # Continue without names/sizes if DB fails, but log error
         finally:
             if conn: conn.close(); conn = None # Close connection
 
@@ -974,7 +1124,6 @@ async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE,
         product_type = item.get('product_type') # Should be stored now
         timestamp = item.get('timestamp')
 
-        # Skip if essential data is missing (shouldn't happen often)
         if prod_id is None or original_price is None or product_type is None or timestamp is None:
             logger.warning(f"Skipping malformed item in basket context user {user_id}: {item}")
             continue
@@ -989,7 +1138,6 @@ async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE,
         total_reseller_discount_amount += item_reseller_discount
         total_after_reseller += item_price_after_reseller
 
-        # Store details for display loop
         db_info = product_db_details.get(prod_id, {})
         basket_items_with_details.append({
             'id': prod_id,
@@ -1052,8 +1200,6 @@ async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE,
         price_display = format_currency(item_detail['discounted_price'])
         if item_detail['has_reseller_discount']:
             original_price_formatted = format_currency(item_detail['original_price'])
-            # Use Markdown V2 for strike-through if desired, otherwise plain text
-            # price_display += f" \\(~~{helpers.escape_markdown(original_price_formatted, version=2)}€~~\\)" # MDv2
             price_display += f" (Orig: {original_price_formatted}€)" # Plain text
 
         timestamp = item_detail['timestamp']
@@ -1075,9 +1221,7 @@ async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Show reseller discount if applied
     if total_reseller_discount_amount > Decimal('0.0'):
         reseller_discount_str = format_currency(total_reseller_discount_amount)
-        # >>> FIX: Use the fetched reseller_discount_label <<<
         msg += f"\n{EMOJI_DISCOUNT} {reseller_discount_label}: -{reseller_discount_str} EUR"
-        # >>> END FIX <<<
     # Show general discount if applied (or note if removed)
     msg += discount_applied_str # Contains formatted string or removal note
     msg += f"\n💳 **{total_label}: {final_total_str} EUR**" # Use plain bolding
@@ -1100,18 +1244,12 @@ async def handle_view_basket(update: Update, context: ContextTypes.DEFAULT_TYPE,
         # Use parse_mode=None as we handle bolding manually or avoid complex Markdown
         await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(final_keyboard), parse_mode=None)
     except telegram_error.BadRequest as e:
-         # --- MODIFIED Error Handling ---
          if "message is not modified" not in str(e).lower():
              logger.error(f"Error editing basket view message: {e}")
          else:
-             # Message not modified, just try to answer quietly. Ignore if answer fails.
-             try:
-                 await query.answer()
-             except telegram_error.BadRequest: # Specifically catch if answer also fails
-                 logger.debug(f"Query answer failed after 'message not modified' for user {user_id} (likely too old).")
-             except Exception as ans_e: # Catch other potential answer errors
-                 logger.warning(f"Error answering query after 'message not modified' for user {user_id}: {ans_e}")
-         # --- END MODIFIED Error Handling ---
+             try: await query.answer()
+             except telegram_error.BadRequest: logger.debug(f"Query answer failed after 'message not modified' for user {user_id} (likely too old).")
+             except Exception as ans_e: logger.warning(f"Error answering query after 'message not modified' for user {user_id}: {ans_e}")
     except Exception as e:
          logger.error(f"Unexpected error viewing basket user {user_id}: {e}", exc_info=True); await query.edit_message_text("❌ Error: Unexpected issue.", parse_mode=None)
 
@@ -1635,6 +1773,12 @@ async def _show_crypto_choices_for_basket(update: Update, context: ContextTypes.
         if query and edit_message: await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=None)
         else: await send_message_with_retry(context.bot, chat_id, msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=None)
         if query: await query.answer("Error: Amount missing.", show_alert=True)
+        # Clear potentially stale state if amount is missing
+        context.user_data.pop('state', None)
+        context.user_data.pop('basket_pay_snapshot', None)
+        context.user_data.pop('basket_pay_total_eur', None)
+        context.user_data.pop('basket_pay_discount_code', None)
+        context.user_data.pop('single_item_orig_params', None)
         return
 
     # --- Generate buttons using SUPPORTED_CRYPTO ---
@@ -1652,7 +1796,12 @@ async def _show_crypto_choices_for_basket(update: Update, context: ContextTypes.
     # --- End Button Generation ---
 
     cancel_button_text = lang_data.get("cancel_button", "Cancel")
-    asset_buttons.append([InlineKeyboardButton(f"❌ {cancel_button_text}", callback_data="view_basket")]) # Cancel returns to basket
+    # <<< Determine correct cancel callback based on state >>>
+    if context.user_data.get('state') == 'awaiting_single_item_crypto_choice':
+        cancel_callback_data = "cancel_single_item_pay"
+    else:
+        cancel_callback_data = "view_basket" # Default cancel for regular basket
+    asset_buttons.append([InlineKeyboardButton(f"❌ {cancel_button_text}", callback_data=cancel_callback_data)])
 
     amount_str = format_currency(total_eur_float)
     prompt_template = lang_data.get("choose_crypto_for_purchase", "Choose crypto to pay {amount} EUR for your basket:")
@@ -1672,170 +1821,6 @@ async def _show_crypto_choices_for_basket(update: Update, context: ContextTypes.
         await send_message_with_retry(context.bot, chat_id, prompt_msg, reply_markup=InlineKeyboardMarkup(asset_buttons), parse_mode=None)
 
 # --- END _show_crypto_choices_for_basket ---
-
-
-# --- CORRECTED Handler for Pay Single Item Button ---
-async def handle_pay_single_item(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
-    """Handles the 'Pay Now' button directly from product selection."""
-    query = update.callback_query
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    lang, lang_data = _get_lang_data(context)
-
-    if not params or len(params) < 5:
-        logger.warning("handle_pay_single_item missing params."); await query.answer("Error: Incomplete product data.", show_alert=True); return
-    city_id, dist_id, p_type, size, price_str = params # price_str is ORIGINAL price
-
-    try: original_price = Decimal(price_str)
-    except ValueError: logger.warning(f"Invalid price format pay_single_item: {price_str}"); await query.edit_message_text("❌ Error: Invalid product data.", parse_mode=None); return
-
-    city = CITIES.get(city_id); district = DISTRICTS.get(city_id, {}).get(dist_id)
-    if not city or not district: error_location_mismatch = lang_data.get("error_location_mismatch", "Error: Location data mismatch."); await query.edit_message_text(f"❌ {error_location_mismatch}", parse_mode=None); return await handle_shop(update, context)
-
-    await query.answer("⏳ Reserving & checking payment...")
-
-    reserved_id = None
-    conn = None
-    product_details_for_snapshot = None
-    error_occurred_reservation = False # Flag specific to reservation phase
-
-    # 1. Attempt to reserve one specific item instance
-    try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("BEGIN EXCLUSIVE")
-        # Find one available product ID matching the criteria
-        c.execute("SELECT id, name, price, size, product_type FROM products WHERE city = ? AND district = ? AND product_type = ? AND size = ? AND price = ? AND available > reserved ORDER BY id LIMIT 1", (city, district, p_type, size, float(original_price)))
-        product_to_reserve = c.fetchone()
-
-        if not product_to_reserve:
-            conn.rollback()
-            logger.warning(f"Item {p_type} {size} in {city}/{district} taken before pay_single user {user_id}.")
-            # Try editing message, ignore if it fails (e.g., query too old)
-            try: await query.edit_message_text("❌ Sorry, this item was just taken!", parse_mode=None)
-            except Exception: pass
-            error_occurred_reservation = True # Set flag but return later
-        else:
-            reserved_id = product_to_reserve['id']
-            product_details_for_snapshot = dict(product_to_reserve) # Store details
-
-            # Attempt to reserve it
-            update_result = c.execute("UPDATE products SET reserved = reserved + 1 WHERE id = ? AND available > reserved", (reserved_id,))
-
-            if update_result.rowcount == 1:
-                conn.commit() # Commit the reservation
-                logger.info(f"Successfully reserved product {reserved_id} for single item payment by user {user_id}.")
-            else:
-                # Race condition - someone else reserved it between SELECT and UPDATE
-                conn.rollback()
-                logger.warning(f"Failed to reserve product {reserved_id} (race condition?) for single item payment user {user_id}.")
-                try: await query.edit_message_text("❌ Sorry, this item was just taken!", parse_mode=None)
-                except Exception: pass
-                error_occurred_reservation = True # Set flag but return later
-
-    except sqlite3.Error as e:
-        logger.error(f"DB error reserving single item {p_type} {size} user {user_id}: {e}")
-        if conn and conn.in_transaction: conn.rollback()
-        try: await query.edit_message_text("❌ Database error during reservation.", parse_mode=None)
-        except Exception: pass
-        error_occurred_reservation = True # Set flag
-    finally:
-        if conn: conn.close()
-
-    # --- Return early if reservation failed ---
-    if error_occurred_reservation:
-        return
-
-    # --- Proceed if reservation was successful ---
-    if reserved_id and product_details_for_snapshot:
-        # 2. Create single-item snapshot
-        single_item_snapshot = [{
-            "product_id": reserved_id,
-            "price": float(original_price), # Store original price as float for JSON later
-            "name": product_details_for_snapshot['name'],
-            "size": product_details_for_snapshot['size'],
-            "product_type": product_details_for_snapshot['product_type']
-        }]
-
-        # 3. Calculate final price (apply reseller discount)
-        reseller_discount_percent = Decimal('0.0')
-        try: # Use await asyncio.to_thread for the synchronous function
-             reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, p_type)
-        except Exception as e:
-             logger.error(f"Error calling get_reseller_discount during single pay: {e}")
-        reseller_discount_amount = (original_price * reseller_discount_percent / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-        final_total_decimal = original_price - reseller_discount_amount
-
-        # 4. Check balance
-        conn_balance = None
-        user_balance = Decimal('0.0')
-        balance_check_error = False
-        try:
-            conn_balance = get_db_connection()
-            c_balance = conn_balance.cursor()
-            c_balance.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-            balance_result = c_balance.fetchone()
-            user_balance = Decimal(str(balance_result['balance'])) if balance_result else Decimal('0.0')
-        except sqlite3.Error as e:
-            logger.error(f"DB error fetching balance for single pay user {user_id}: {e}")
-            # Attempt to un-reserve the item if balance check fails
-            logger.info(f"Attempting to un-reserve item {reserved_id} due to balance check failure.")
-            await asyncio.to_thread(_unreserve_basket_items, single_item_snapshot) # Use helper
-            try: await query.edit_message_text("❌ Error checking balance. Item released.", parse_mode=None)
-            except Exception: pass
-            balance_check_error = True
-        finally:
-            if conn_balance: conn_balance.close()
-
-        if balance_check_error:
-             return # Stop if balance check failed
-
-        # 5. Decide payment method
-        if user_balance >= final_total_decimal:
-            # --- CORRECTED PART: Pay with balance ---
-            logger.info(f"Sufficient balance for single item pay user {user_id}. Calling process_purchase_with_balance.")
-            try:
-                # Edit message first to show processing
-                await query.edit_message_text("⏳ Processing payment with balance...", parse_mode=None)
-            except telegram_error.BadRequest as e:
-                 if "message is not modified" not in str(e).lower(): logger.warning(f"Could not edit message before balance payment: {e}")
-                 # Continue anyway
-
-            # Call the function that handles balance deduction AND finalization
-            success = await payment.process_purchase_with_balance(
-                user_id=user_id,
-                amount_to_deduct=final_total_decimal, # Pass the calculated final price
-                basket_snapshot=single_item_snapshot,
-                discount_code_used=None, # No general discount code for single item pay
-                context=context
-            )
-
-            if success:
-                # Success messages are handled within _finalize_purchase called by process_purchase_with_balance
-                logger.info(f"process_purchase_with_balance successful for single item {reserved_id} user {user_id}.")
-                # No need to edit message here again, it's handled internally
-            else:
-                 # Failure messages are handled within process_purchase_with_balance or _finalize_purchase
-                 logger.error(f"process_purchase_with_balance failed for single item {reserved_id} user {user_id}.")
-                 # The item *should* have been un-reserved if the finalization failed after balance deduction attempt.
-                 # If balance deduction itself failed, finalization wasn't called. Reservation might still exist in rare edge cases.
-
-        else:
-            # --- Insufficient balance -> Crypto payment ---
-            logger.info(f"Insufficient balance for single item pay user {user_id}. Triggering crypto flow.")
-            context.user_data['basket_pay_snapshot'] = single_item_snapshot
-            context.user_data['basket_pay_total_eur'] = float(final_total_decimal) # Use final price after reseller
-            context.user_data['basket_pay_discount_code'] = None # No general code for single pay
-
-            await _show_crypto_choices_for_basket(update, context, edit_message=True)
-            # No need for extra query.answer() here as _show_crypto does it if needed
-    else:
-        # This case should ideally not be reached if error_occurred_reservation was handled
-        logger.error(f"Reached end of handle_pay_single_item without valid reservation for user {user_id}")
-        try: await query.edit_message_text("❌ An internal error occurred during payment initiation.", parse_mode=None)
-        except Exception: pass
-
-# --- END handle_pay_single_item ---
 
 
 # --- Other User Handlers ---
