@@ -591,7 +591,8 @@ async def handle_type_selection(update: Update, context: ContextTypes.DEFAULT_TY
 # --- END OF handle_type_selection ---
 
 
-# <<< MODIFIED: Add Pay Now Button >>>
+# --- MODIFIED: Add Pay Now Button and Store Original Params for Cancel ---
+# <<< Ensure this function definition exists and is spelled correctly >>>
 async def handle_product_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     query = update.callback_query
     user_id = query.from_user.id # <<< Get user_id
